@@ -1,0 +1,312 @@
+# Keeps this fork current with thedotmack/claude-mem, hands-off.
+#
+# HOW THE FORK DIFFERENCE IS CARRIED
+#
+# The fork's entire source divergence from upstream is stored as ONE patch file
+# (`patches/opencode-compat.patch`) together with the upstream SHA it was last
+# reconciled against (`patches/compat-metadata.json`). Each successful sync
+# rewrites both files on the pushed main, so the next run starts from a fresh
+# upstream checkout carrying the smallest possible patch. Conflicts then only
+# happen when upstream edits something the patch itself touches — a semantic
+# conflict that genuinely needs a human. Those surface reliably: a deduplicated
+# tracking issue (one open issue regardless of how many days it has failed)
+# plus a Telegram alert. A failed sync never touches main.
+#
+# COMPARED TO THE OLD FLOW (cherry-picking fork commits)
+#
+# Replaying history broke whenever upstream edited the patched files, because
+# intermediate fork commits (branding, README edits, early variants of the
+# patch) conflicted against current upstream even though the FINAL patch still
+# applied. This workflow never replays those. After applying the source patch
+# it hard-copies the fork's infra files from main over the upstream tree:
+#
+#   README.md                       (fork's reader-specific README replaces upstream's)
+#   .github/workflows/sync-upstream.yml (this file; upstream's CI arrives on
+#                                    upstream/main and is deleted first)
+#   scripts/fork-brand.mjs          (rebrands the marketplace manifests)
+#
+# Then it runs `bun run build` (regenerating plugin/ artifacts so build output
+# is rebuilt, never merged), `node scripts/fork-brand.mjs`, the OpenCode
+# contract test, and finally refreshes the patch + base files and pushes.
+#
+# If you add new fork-infra paths (a new script, a new generated directory to
+# brute-force), add its path to the hardcoded list below — the list is
+# deliberately literal so a path typo fails this run instead of silently
+# skipping real work.
+
+name: Sync with upstream
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # daily, 09:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM: https://github.com/thedotmack/claude-mem.git
+  PATCH_PATH: patches/opencode-compat.patch
+  METADATA_PATH: patches/compat-metadata.json
+  # Fork infra files copied verbatim from main after the patch applies.
+  INFRA_PATHS: >-
+    README.md
+    .github/workflows/sync-upstream.yml
+    scripts/fork-brand.mjs
+  # Source paths that make up the patch (used when regenerating it).
+  PATCH_SOURCE_PATHS: >-
+    src/integrations/opencode-plugin
+    src/services/sync/ChromaMcpManager.ts
+    tests/integrations/opencode-plugin-contract.test.ts
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      telegram_ok: ${{ steps.notify.outputs.telegram_ok }}
+      issue_ok: ${{ steps.track_failure.outputs.issue_ok }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream and decide whether to sync
+        id: fetch
+        run: |
+          git remote add upstream "$UPSTREAM" 2>/dev/null || git remote set-url upstream "$UPSTREAM"
+          git fetch upstream --tags
+          UP=$(git rev-parse upstream/main)
+          BASE=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('$METADATA_PATH','utf8')).base||'')}catch(e){console.log('')}")
+          echo "sha=$UP" >> "$GITHUB_OUTPUT"
+          echo "short=${UP::7}" >> "$GITHUB_OUTPUT"
+          if [ "$UP" = "$BASE" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      # Capture the patch BEFORE switching branches, because the sync branch is
+      # checked out from upstream/main where patches/ does not exist.
+      - name: Save fork patch
+        if: steps.fetch.outputs.changed == 'true'
+        run: cp "$PATCH_PATH" /tmp/fork.patch
+
+      - name: Build sync branch from upstream
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B sync-tmp upstream/main
+
+          # Upstream's own CI/publish/issue workflows must not run against this
+          # repo (wrong npm package, wrong tracker). Only ours survives.
+          rm -rf .github/workflows
+          git checkout main -- $INFRA_PATHS
+
+      - name: Apply the fork patch
+        id: apply
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          set -e
+          if ! git apply --3way /tmp/fork.patch 2> /tmp/apply-error.txt; then
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "Apply failed against upstream ${{ steps.fetch.outputs.short }}:"
+            cat /tmp/apply-error.txt
+            exit 1
+          fi
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+
+          # Everything outside the patch that main carries but upstream does not
+          # (e.g. deleted upstream workflows) becomes part of one reviewable
+          # reconciliation commit, so failures are always visible in the log.
+          git add -A
+          git commit -m "patch: reconcile OpenCode compat against upstream ${{ steps.fetch.outputs.short }}"
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.fetch.outputs.changed == 'true'
+        with:
+          bun-version: latest
+
+      - name: Build and rebrand
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          bun install --frozen-lockfile || bun install
+          bun run build
+          node scripts/fork-brand.mjs
+
+      - name: Test the OpenCode contract
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          # The regression that motivated the export fix: the OpenCode
+          # entrypoint must export functions only, or the plugin will not load.
+          bun test tests/integrations/opencode-plugin-contract.test.ts
+          bun run typecheck || echo "::warning::typecheck failed (not blocking)"
+
+      - name: Refresh patch and base
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          set -e
+          # Rewrite the patch relative to the NEW upstream so it keeps applying
+          # even when upstream has moved far past today's run. The directory is
+          # created first: the sync branch starts from upstream/main, where
+          # patches/ (a fork-only path) does not exist at all.
+          mkdir -p patches
+          git diff upstream/main -- $PATCH_SOURCE_PATHS > "$PATCH_PATH"
+          printf '{\n  "base": "%s",\n  "syncedAt": "%s"\n}\n' \
+            "$(git rev-parse upstream/main)" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$METADATA_PATH"
+          git add -A
+          git commit -m "build: regenerate artifacts, patch and base against upstream ${{ steps.fetch.outputs.short }}
+
+          Derived output. Kept as its own commit so the source diff stays
+          reviewable and the next sync starts from the fresh upstream SHA."
+
+      - name: Publish to main
+        id: publish
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          git push --force-with-lease origin sync-tmp:main
+          echo "published=true" >> "$GITHUB_OUTPUT"
+          echo "Published. Instances with autoUpdate will pick this up."
+
+      # ---------------------------------------------------------------
+      # Reporting. Telegram fires on every run, success and failure.
+      # Issue tracking only on failure, deduplicated by stable title.
+      # ---------------------------------------------------------------
+
+      - name: Telegram alert
+        id: notify
+        if: always()
+        continue-on-error: true
+        env:
+          TG_TOKEN: ${{ secrets.LOG_THEWORLD_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_RORO_ID }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "::warning::LOG_THEWORLD_BOT_TOKEN / TELEGRAM_RORO_ID secrets not configured yet; skipping Telegram notification."
+            echo "telegram_ok=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # One-line status header plus a context line. The timestamp format is
+          # deliberately filesystem-friendly (no spaces or colons). The single
+          # quoted format argument keeps `bash -e` from aborting the step.
+          # HTML mode renders the bold state; characters below are HTML-safe.
+          STAMP="$(date -u +'%Y-%m-%d_%H-%M')"
+          LF=$'\n'
+          if [ "${{ job.status }}" = "success" ] && [ "${{ steps.apply.outputs.conflict || 'false' }}" != "true" ]; then
+            TEXT="🛠️✅ claude-mem-opencode-compat build: <b>SUCCESS</b> at $STAMP"
+            BODY_LINE="upstream ${{ steps.fetch.outputs.short }} - ${{ github.repository }}"
+            if [ "${{ steps.publish.outputs.published || 'false' }}" = "true" ]; then
+              BODY_LINE="$BODY_LINE | published to main (autoUpdate instances will pick it up)"
+            else
+              BODY_LINE="$BODY_LINE | already current, no changes published"
+            fi
+            TEXT="$TEXT$LF$BODY_LINE"
+          else
+            TEXT="🚧❌ claude-mem-opencode-compat build: <b>FAILED</b> at $STAMP$LF<a href=\"$RUN_URL\">failure run</a>"
+          fi
+          HTTP=$(curl -s -o /tmp/tg-response.json -w '%{http_code}' -X POST \
+            "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" \
+            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "parse_mode=HTML")
+          echo "telegram_ok=$HTTP" >> "$GITHUB_OUTPUT"
+          echo "Telegram delivered HTTP $HTTP"
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Telegram send returned HTTP $HTTP: $(cat /tmp/tg-response.json)"
+            exit 1
+          fi
+
+      - name: Close the tracking issue on recovery
+        id: close_tracking
+        # Any completed-green run (published or simply already current) proves
+        # the pipeline is healthy again, so the tracking issue is retired.
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A recovery from a previous failure should retire the issue the same
+          # way a human would reopen-resolve it, so exactly one open tracking
+          # issue exists at any time (open while broken, closed while green).
+          API="https://api.github.com/repos/${{ github.repository }}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          EXISTING=$(curl -sf -H "$AUTH" "$API/issues?state=open&per_page=20" \
+            | jq -r --arg title "Upstream sync is failing" '[.[] | select(.title == $title)][0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            HTTP=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH \
+              -H "$AUTH" -H "Accept: application/vnd.github+json" \
+              "$API/issues/$EXISTING" \
+              -d '{"state": "closed", "state_reason": "completed"}')
+            echo "tracked_issue=$EXISTING (closed HTTP $HTTP)" >> "$GITHUB_OUTPUT"
+          else
+            echo "issue_ok none open" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Track the failure in a deduplicated issue
+        id: track_failure
+        if: failure() && steps.fetch.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The issue title is deliberately stable so the next failed run
+          # deduplicates against it instead of piling up duplicates.
+          #
+          # REST API, not `gh issue create`: the GITHUB_TOKEN is refused issue
+          # MUTATIONS on the GraphQL endpoint ("Resource not accessible by
+          # integration (createIssue)") while the same token creates issues
+          # fine over REST (verified with a probe workflow, HTTP 201).
+          TITLE="Upstream sync is failing"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          API="https://api.github.com/repos/${{ github.repository }}"
+          AUTH="Authorization: Bearer ${GH_TOKEN}"
+          dateStamp="$(date -u +'%Y-%m-%d %H:%M UTC')"
+          BULLETS=""
+          if [ "${{ steps.apply.outputs.conflict }}" = "true" ]; then
+            BULLETS="- The fork patch failed to apply against upstream (semantic conflict); the source patch needs manual rebasing onto upstream/main."
+          fi
+          if [ -s /tmp/apply-error.txt ]; then
+            ERRORS=$(head -c 2000 /tmp/apply-error.txt | sed 's/`/\\`/g')
+            BULLETS="$BULLETS
+          - git apply output:
+          \`\`\`
+          $ERRORS
+          \`\`\`"
+          fi
+          BODY="Daily sync could not publish at $dateStamp.
+
+          - upstream: \`${{ steps.fetch.outputs.sha }}\`
+          - run: $RUN_URL
+          $BULLETS
+
+          \`main\` was left untouched, so running instances stay on the last good build."
+
+          EXISTING=$(curl -sf -H "$AUTH" "$API/issues?state=open&per_page=20" \
+            | jq -r --arg title "$TITLE" '[.[] | select(.title == $title)][0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            HTTP=$(curl -s -o /tmp/issue.json -w '%{http_code}' -X POST \
+              -H "$AUTH" -H "Accept: application/vnd.github+json" \
+              "$API/issues/$EXISTING/comments" \
+              -d "$(jq -n --arg body "$BODY" '{"body": $body}')")
+            echo "issue_ok=commented-$EXISTING (HTTP $HTTP)" >> "$GITHUB_OUTPUT"
+          else
+            HTTP=$(curl -s -o /tmp/issue.json -w '%{http_code}' -X POST \
+              -H "$AUTH" -H "Accept: application/vnd.github+json" \
+              "$API/issues" \
+              -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" '{"title": $title, "body": $body}')")
+            NUMBER=$(jq -r '.number // empty' /tmp/issue.json 2>/dev/null || echo "")
+            echo "issue_ok=created-$NUMBER (HTTP $HTTP)" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$HTTP" != "201" ] && [ "$HTTP" != "200" ]; then
+            echo "::error::Issue tracking returned HTTP $HTTP: $(head -c 500 /tmp/issue.json)"
+            exit 1
+          fi

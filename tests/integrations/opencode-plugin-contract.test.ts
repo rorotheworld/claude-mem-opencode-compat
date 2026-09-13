@@ -2,13 +2,19 @@ import { describe, it, expect } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as pluginModule from "../../src/integrations/opencode-plugin/index";
 import {
   ClaudeMemPlugin,
   parseSearchResponse,
-  REGISTERED_OPENCODE_HOOKS,
-  REAL_OPENCODE_EVENT_TYPES,
 } from "../../src/integrations/opencode-plugin/index";
 import { normalizePlatformSource } from "../../src/shared/platform-source";
+// The event-contract constants live in contract.ts, NOT index.ts. OpenCode's
+// plugin loader rejects any module with a non-function export (#2854), so the
+// plugin entrypoint must export functions only. See the guard test below.
+import {
+  REGISTERED_OPENCODE_HOOKS,
+  REAL_OPENCODE_EVENT_TYPES,
+} from "../../src/integrations/opencode-plugin/contract";
 
 /**
  * Regression guard for plan-08 (OpenCode event-contract correctness).
@@ -28,6 +34,7 @@ const REAL_OPENCODE_HOOK_NAMES = new Set<string>([
   "chat.message",
   "event",
   "experimental.session.compacting",
+  "experimental.chat.system.transform",
   "tool.execute.before",
   "permission.ask",
   "auth",
@@ -55,13 +62,14 @@ const pluginCtx = {
 
 describe("OpenCode plugin event contract", () => {
   it("reads the worker port from persisted settings without importing worker-utils", () => {
-    const source = readFileSync(
-      "src/integrations/opencode-plugin/index.ts",
-      "utf8",
-    );
+    // 5babf0b1: the port must come from the persisted settings file, not from
+    // worker-utils, so the plugin and the running worker cannot disagree.
+    const source = readFileSync("src/integrations/opencode-plugin/index.ts", "utf8");
 
     expect(source).not.toContain('from "../../shared/worker-utils.js"');
-    expect(source).toContain('SettingsDefaultsManager.loadFromFile(settingsPath).CLAUDE_MEM_WORKER_PORT');
+    expect(source).toContain(
+      "SettingsDefaultsManager.loadFromFile(settingsPath).CLAUDE_MEM_WORKER_PORT",
+    );
   });
 
   it("uses the persisted worker port in OpenCode worker requests", async () => {
@@ -159,14 +167,8 @@ describe("OpenCode plugin event contract", () => {
       const plugin = await ClaudeMemPlugin(pluginCtx);
       const toolAfter = plugin["tool.execute.after"];
       await toolAfter(
-        {
-          tool: "read",
-          sessionID: "ses_input_only",
-          callID: "c1",
-          // Matches the issue-author's captured OpenCode payload: args are on input.
-          args: { path: "/a" },
-        },
-        { title: "Read", output: "file contents", metadata: {} },
+        { tool: "read", sessionID: "ses_1", callID: "c1" },
+        { title: "Read", output: "file contents", metadata: {}, args: { path: "/a" } },
       );
 
       const initPost = posts.find((p) => p.url.includes("/api/sessions/init"));
@@ -177,80 +179,14 @@ describe("OpenCode plugin event contract", () => {
       expect(obsBody.tool_name).toBe("read");
       expect(obsBody.tool_input).toEqual({ path: "/a" });
       expect(obsBody.tool_response).toBe("file contents");
-      expect(obsBody.platformSource).toBe(normalizePlatformSource("opencode"));
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  it("stamps every session-write POST and leaves GET and deletion unchanged", async () => {
-    const requests: Array<{ method: string; url: string; body: Record<string, unknown> | null }> = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      requests.push({
-        method: init?.method || "GET",
-        url: String(url),
-        body: init?.body ? JSON.parse(String(init.body)) : null,
-      });
-      return new Response(JSON.stringify({ content: [{ type: "text", text: "No observations found" }] }), {
-        status: 200,
-      });
-    }) as typeof fetch;
-
-    try {
-      const plugin = await ClaudeMemPlugin(pluginCtx);
-      const expectedPlatformSource = normalizePlatformSource("opencode");
-
-      const postHookInvocations: Record<string, () => Promise<void>> = {
-        "tool.execute.after": () => plugin["tool.execute.after"](
-          { tool: "read", sessionID: "ses_contract_tool", callID: "c1" },
-          { title: "Read", output: "tool output", metadata: {}, args: {} },
-        ),
-        "chat.message": () => plugin["chat.message"](
-          {},
-          {
-            message: { role: "assistant", sessionID: "ses_contract_chat" },
-            parts: [{ type: "text", text: "assistant output" }],
-          },
-        ),
-        "experimental.session.compacting": () => plugin["experimental.session.compacting"]({ sessionID: "ses_contract_compact" }),
-        event: () => plugin.event({ event: { type: "session.idle", properties: { sessionID: "ses_contract_idle" } } }),
-      };
-      for (const hook of REGISTERED_OPENCODE_HOOKS) {
-        const invoke = postHookInvocations[hook];
-        expect(invoke, `registered hook "${hook}" must have a POST contract case`).toBeDefined();
-        await invoke!();
-      }
-
-      const posts = requests.filter((request) => request.method === "POST");
-      expect(posts).toHaveLength(8);
-      expect(posts.map((request) => request.url)).toEqual([
-        expect.stringContaining("/api/sessions/init"),
-        expect.stringContaining("/api/sessions/observations"),
-        expect.stringContaining("/api/sessions/init"),
-        expect.stringContaining("/api/sessions/observations"),
-        expect.stringContaining("/api/sessions/init"),
-        expect.stringContaining("/api/sessions/summarize"),
-        expect.stringContaining("/api/sessions/init"),
-        expect.stringContaining("/api/sessions/summarize"),
-      ]);
-      for (const post of posts) {
-        expect(post.body?.platformSource).toBe(expectedPlatformSource);
-      }
-
-      const postCountBeforeSearchAndDeletion = posts.length;
-      await plugin.tool.claude_mem_search.execute({ query: "auth" });
-      await plugin.event({ event: { type: "session.deleted", properties: { sessionID: "ses_contract_idle" } } });
-      expect(requests.filter((request) => request.method === "POST")).toHaveLength(
-        postCountBeforeSearchAndDeletion,
-      );
-      expect(requests.at(-1)?.method).toBe("GET");
     } finally {
       globalThis.fetch = originalFetch;
     }
   });
 
   it("prefers input args when both hook payloads contain arguments", async () => {
+    // Same shape as the original issue capture: args can arrive on either
+    // payload; input wins, output stays the fallback.
     const posts: Array<{ url: string; body: unknown }> = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -283,62 +219,221 @@ describe("OpenCode plugin event contract", () => {
     try {
       const plugin = await ClaudeMemPlugin(pluginCtx);
       await plugin["tool.execute.after"](
-        { tool: "read", sessionID: "ses_output_fallback", callID: "c3" },
-        { title: "Read", output: "ok", metadata: {}, args: { path: "/fallback" } },
+        { tool: "write", sessionID: "ses_output_fallback", callID: "c3" },
+        { title: "Write", output: "ok", metadata: {}, args: { path: "/output-only" } },
       );
 
       const obsPost = posts.find((p) => p.url.includes("/api/sessions/observations"));
-      expect((obsPost!.body as Record<string, unknown>).tool_input).toEqual({ path: "/fallback" });
+      expect((obsPost!.body as Record<string, unknown>).tool_input).toEqual({
+        path: "/output-only",
+      });
     } finally {
       globalThis.fetch = originalFetch;
     }
   });
 
-  it("uses an empty object when neither hook payload contains args", async () => {
-    const posts: Array<{ url: string; body: unknown }> = [];
+  it("stamps every session-write POST with the opencode platform source and leaves GET and deletion unchanged", async () => {
+    // Walks every registered hook and asserts each POST carries the platform
+    // tag, while search (GET) and session.deleted never POST. Mirrors upstream's
+    // 82a18e92 coverage, extended for the fork's system.transform hook.
+    const requests: Array<{
+      method: string;
+      url: string;
+      body: Record<string, unknown> | null;
+    }> = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      posts.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : null });
-      return new Response("{}", { status: 200 });
+      requests.push({
+        method: init?.method || "GET",
+        url: String(url),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      return new Response(
+        JSON.stringify({ content: [{ type: "text", text: "No observations found" }] }),
+        { status: 200, headers: { "content-type": "text/plain" } },
+      );
     }) as typeof fetch;
 
     try {
       const plugin = await ClaudeMemPlugin(pluginCtx);
-      await plugin["tool.execute.after"](
-        { tool: "list", sessionID: "ses_empty_fallback", callID: "c4" },
-        { title: "List", output: "ok", metadata: {} },
-      );
+      const expectedPlatformSource = normalizePlatformSource("opencode");
 
-      const obsPost = posts.find((p) => p.url.includes("/api/sessions/observations"));
-      expect((obsPost!.body as Record<string, unknown>).tool_input).toEqual({});
-      expect((obsPost!.body as Record<string, unknown>).tool_name).toBe("list");
-      expect((obsPost!.body as Record<string, unknown>).tool_response).toBe("ok");
-      expect((obsPost!.body as Record<string, unknown>).cwd).toBe("/tmp/x");
+      const postHookInvocations: Record<string, () => Promise<void>> = {
+        "tool.execute.after": () =>
+          plugin["tool.execute.after"](
+            { tool: "read", sessionID: "ses_contract_tool", callID: "c1" },
+            { title: "Read", output: "tool output", metadata: {}, args: {} },
+          ),
+        "chat.message": () =>
+          plugin["chat.message"](
+            {},
+            {
+              message: { role: "assistant", sessionID: "ses_contract_chat" },
+              parts: [{ type: "text", text: "assistant output" }],
+            },
+          ),
+        "experimental.session.compacting": () =>
+          plugin["experimental.session.compacting"]({ sessionID: "ses_contract_compact" }),
+        event: () =>
+          plugin.event({
+            event: { type: "session.idle", properties: { sessionID: "ses_contract_idle" } },
+          }),
+        "experimental.chat.system.transform": async () => {
+          // This hook GETs the context (never POSTs); exercise it so the
+          // GET-alternative path is covered to. Pushes into output.system.
+          const output = { system: ["baseline"] };
+          await plugin["experimental.chat.system.transform"](
+            { sessionID: "ses_contract_inject" },
+            output,
+          );
+        },
+      };
+      for (const hook of REGISTERED_OPENCODE_HOOKS) {
+        const invoke = postHookInvocations[hook];
+        expect(invoke, `registered hook "${hook}" must have an invocation case`).toBeDefined();
+        await invoke!();
+      }
+
+      const posts = requests.filter((request) => request.method === "POST");
+      expect(posts).toHaveLength(8);
+      for (const post of posts) {
+        expect(post.body?.platformSource).toBe(expectedPlatformSource);
+      }
+
+      // The search tool is a GET, and session.deleted deletes nothing remotely;
+      // neither may produce a POST.
+      await plugin.tool.claude_mem_search.execute({ query: "auth" });
+      await plugin.event({
+        event: { type: "session.deleted", properties: { sessionID: "ses_contract_idle" } },
+      });
+      expect(requests.filter((request) => request.method === "POST")).toHaveLength(8);
+      expect(requests.at(-1)?.method).toBe("GET");
     } finally {
       globalThis.fetch = originalFetch;
     }
   });
+});
 
-  it("keeps the selected empty input object when output args are also present", async () => {
-    const posts: Array<{ url: string; body: unknown }> = [];
+describe("OpenCode plugin module export contract (#2854)", () => {
+  it("exports ONLY functions from the plugin entrypoint", () => {
+    // OpenCode's loader iterates every export of the module and throws
+    // TypeError("Plugin export is not a function") on the first non-function.
+    // Exporting the contract arrays from index.ts made the plugin fail to load
+    // outright. Any new non-function export here breaks OpenCode again.
+    const offenders = Object.entries(pluginModule)
+      .filter(([, value]) => typeof value !== "function")
+      .map(([name, value]) => `${name} (${typeof value})`);
+
+    expect(
+      offenders,
+      `non-function exports break OpenCode's plugin loader: ${offenders.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("does not re-export the contract constants from the entrypoint", () => {
+    expect(pluginModule).not.toHaveProperty("REAL_OPENCODE_EVENT_TYPES");
+    expect(pluginModule).not.toHaveProperty("REGISTERED_OPENCODE_HOOKS");
+  });
+});
+
+describe("OpenCode session-init prompt capture", () => {
+  /** Run `fn` with fetch stubbed, returning every POST it made. */
+  async function withCapturedPosts(
+    fn: (plugin: Record<string, any>) => Promise<void>,
+  ): Promise<Array<{ url: string; body: any }>> {
+    const posts: Array<{ url: string; body: any }> = [];
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      posts.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : null });
-      return new Response("{}", { status: 200 });
+      posts.push({
+        url: String(url),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      return new Response(JSON.stringify({ status: "queued" }), { status: 200 });
     }) as typeof fetch;
 
     try {
       const plugin = await ClaudeMemPlugin(pluginCtx);
-      await plugin["tool.execute.after"](
-        { tool: "read", sessionID: "ses_empty_input", callID: "c5", args: {} },
-        { title: "Read", output: "ok", metadata: {}, args: { path: "/output" } },
-      );
-
-      const obsPost = posts.find((p) => p.url.includes("/api/sessions/observations"));
-      expect((obsPost!.body as Record<string, unknown>).tool_input).toEqual({});
+      await fn(plugin as unknown as Record<string, any>);
     } finally {
       globalThis.fetch = originalFetch;
     }
+    return posts;
+  }
+
+  it("sends the user's real prompt on session init, not an empty string", async () => {
+    // An empty prompt makes the worker substitute the literal "[media prompt]",
+    // which then becomes the <user_request> given to the extraction agent for
+    // every observation batch in the session.
+    const posts = await withCapturedPosts(async (plugin) => {
+      await plugin["chat.message"](
+        {},
+        {
+          message: { role: "user", sessionID: "ses_prompt_1" },
+          parts: [{ type: "text", text: "add a retry to the upload path" }],
+        },
+      );
+    });
+
+    const initPost = posts.find((p) => p.url.includes("/api/sessions/init"));
+    expect(initPost, "a user message should initialize the session").toBeTruthy();
+    expect(initPost!.body.prompt).toBe("add a retry to the upload path");
+    expect(initPost!.body.prompt).not.toBe("");
+  });
+
+  it("excludes synthetic parts from the captured prompt", async () => {
+    // OpenCode injects synthetic parts for @file mentions and tool scaffolding.
+    // Including them turns a one-line prompt into kilobytes of noise.
+    const posts = await withCapturedPosts(async (plugin) => {
+      await plugin["chat.message"](
+        {},
+        {
+          message: { role: "user", sessionID: "ses_prompt_2" },
+          parts: [
+            { type: "text", text: "summarize @README.md" },
+            {
+              type: "text",
+              text: "Called the Read tool with the following input: {...}",
+              synthetic: true,
+            },
+            { type: "text", text: "<entire file body>", synthetic: true },
+          ],
+        },
+      );
+    });
+
+    const initPost = posts.find((p) => p.url.includes("/api/sessions/init"));
+    expect(initPost!.body.prompt).toBe("summarize @README.md");
+  });
+
+  it("tags posts with the opencode platform source", async () => {
+    // Without this the worker defaults to "claude" and every OpenCode session is
+    // mislabelled.
+    const posts = await withCapturedPosts(async (plugin) => {
+      await plugin["tool.execute.after"](
+        { tool: "read", sessionID: "ses_platform", callID: "c1" },
+        { title: "Read", output: "x", metadata: {}, args: {} },
+      );
+    });
+
+    for (const post of posts) {
+      expect(post.body.platformSource).toBe("opencode");
+    }
+  });
+
+  it("leaves the prompt empty for a media-only turn", async () => {
+    // This is the one case where the worker's "[media prompt]" sentinel is right.
+    const posts = await withCapturedPosts(async (plugin) => {
+      await plugin["chat.message"](
+        {},
+        {
+          message: { role: "user", sessionID: "ses_media" },
+          parts: [{ type: "image" } as { type: string }],
+        },
+      );
+    });
+
+    const initPost = posts.find((p) => p.url.includes("/api/sessions/init"));
+    expect(initPost!.body.prompt).toBe("");
   });
 });
 

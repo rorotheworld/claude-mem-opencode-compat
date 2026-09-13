@@ -684,6 +684,45 @@ export class ChromaMcpManager {
     return () => tail.trim();
   }
 
+  /**
+   * Best-effort purge of orphaned uv build temp dirs (FORK FIX, 2026-08-15).
+   *
+   * uv builds ephemeral environments in <cache>/builds-v0 using `.tmp*` dirs
+   * that are renamed into place only on a successful build. Any interruption
+   * (prewarm timeout, worker kill, crash, concurrent spawn) leaves them
+   * orphaned and file-locked; the next prewarm then collides with a stale
+   * locked dir and fails before completing, silently degrading semantic
+   * search to keyword (Windows os error 32 class). Upstream #3540 stops the
+   * KILL path from leaking a scratch dir; this purge additionally cleans up
+   * orphans left by any other interruption before every prewarm, so one bad
+   * build cannot poison the next. Locked dirs fail silently and are left
+   * alone (an in-flight build owns them); a missing/unreadable cache dir is
+   * not an error.
+   */
+  private static purgeStaleUvBuildTempDirs(): void {
+    try {
+      const cacheDir =
+        process.env.UV_CACHE_DIR ??
+        (process.platform === 'win32'
+          ? path.join(process.env.LOCALAPPDATA ?? os.homedir(), 'uv', 'cache')
+          : path.join(os.homedir(), '.cache', 'uv'));
+      const buildsDir = path.join(cacheDir, 'builds-v0');
+      const entries = fs.readdirSync(buildsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !entry.name.startsWith('.tmp')) continue;
+        const target = path.join(buildsDir, entry.name);
+        try {
+          fs.rmSync(target, { recursive: true, force: true });
+          logger.debug('CHROMA_MCP', 'purged stale uv build temp dir', { target });
+        } catch {
+          // locked by an in-flight build - leave it
+        }
+      }
+    } catch {
+      // builds dir missing or unreadable - nothing to clean
+    }
+  }
+
   private async prewarmChromaMcp(
     command: string,
     commandArgs: string[],
@@ -691,6 +730,10 @@ export class ChromaMcpManager {
     connectionGeneration: number,
   ): Promise<void> {
     this.assertConnectionNotCancelled(connectionGeneration);
+
+    // Clean stale locked uv build temp dirs BEFORE spawning, so an interrupted
+    // previous build cannot fail this prewarm (see purgeStaleUvBuildTempDirs).
+    ChromaMcpManager.purgeStaleUvBuildTempDirs();
 
     const args = ChromaMcpManager.buildPrewarmCommandArgs(commandArgs);
     const timeoutMs = ChromaMcpManager.getChromaPrewarmTimeoutMs();
