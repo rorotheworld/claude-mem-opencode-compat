@@ -1,5 +1,5 @@
 {
-  "name": "claude-mem-local",
+  "name": "roro-opencode-compat",
   "interface": {
     "displayName": "claude-mem (local)"
   },
@@ -14,7 +14,14 @@
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
-      "category": "Productivity"
+      "category": "Productivity",
+      "description": " (OpenCode-compatible fork)"
     }
-  ]
+  ],
+  "owner": {
+    "name": "roro"
+  },
+  "metadata": {
+    "description": "Tracking fork of thedotmack/claude-mem with fixes to its OpenCode integration. See https://github.com/rorotheworld/claude-mem-opencode-compat"
+  }
 }
